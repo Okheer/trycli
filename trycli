@@ -1,28 +1,384 @@
 #!/usr/bin/env bash
-# A minimal CLI for testing installation on different devices.
-set -eu
+# trycli: a single-file CLI for testing installs across devices.
+# Sticks to bash 3.2 features and portable tools, so it also runs on the bash that ships with macOS.
+set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
+UPDATE_URL="${TRYCLI_UPDATE_URL:-https://raw.githubusercontent.com/Okheer/trycli/main/trycli}"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/trycli"
+NOTES_FILE="$DATA_DIR/notes.tsv"
 
-case "${1:-}" in
-  "")
-    echo "trycli is working on this device."
-    echo "  OS:      $(uname -s)"
-    echo "  CPU:     $(uname -m)"
-    echo "  Shell:   ${SHELL:-unknown}"
-    echo "  Runs at: $0"
-    ;;
-  hello)
-    echo "Hello, ${2:-world}!"
-    ;;
-  -v | --version)
-    echo "trycli $VERSION"
-    ;;
-  -h | --help)
-    echo "Usage: trycli [hello NAME | --version | --help]"
-    ;;
-  *)
-    echo "Unknown command: $1 (try: trycli --help)" >&2
-    exit 1
-    ;;
-esac
+# ---------- output ----------
+
+GREEN="" YELLOW="" RED="" BOLD="" DIM="" RESET=""
+
+enable_color() {
+  GREEN=$'\033[32m' YELLOW=$'\033[33m' RED=$'\033[31m' BOLD=$'\033[1m' DIM=$'\033[2m' RESET=$'\033[0m'
+}
+
+die() {
+  printf '%strycli: %s%s\n' "$RED" "$*" "$RESET" >&2
+  exit 1
+}
+
+json_escape() {
+  printf '%s' "$1" | awk 'BEGIN { ORS = "" } { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); print }'
+}
+
+usage() {
+  cat <<EOF
+${BOLD}trycli${RESET} $VERSION: try a CLI install on any device
+
+${BOLD}Usage:${RESET} trycli [--no-color] <command>
+
+${BOLD}Commands:${RESET}
+  info [--json]            Show details about this device
+  doctor                   Check that this device can run and update trycli
+  hello [NAME]             Say hello
+  note add TEXT            Save a note
+  note list                List saved notes
+  note done ID             Mark a note as done
+  note rm ID               Delete a note
+  note clear [-y]          Delete all notes
+  update [--check]         Install the latest version from GitHub
+  uninstall [-y] [--purge] Remove trycli (--purge also deletes your notes)
+  version                  Show the version
+  help                     Show this help
+EOF
+}
+
+# ---------- device details ----------
+
+self_path() {
+  local path="$0"
+  case "$path" in
+    */*) ;;
+    *) [ -f "$path" ] && path="./$path" || path="$(command -v -- "$path" || printf '%s' "$path")" ;;
+  esac
+  printf '%s/%s' "$(cd "$(dirname "$path")" && pwd)" "$(basename "$path")"
+}
+
+os_name() {
+  case "$(uname -s)" in
+    Darwin)
+      printf 'macOS %s' "$(sw_vers -productVersion 2>/dev/null || echo unknown)"
+      ;;
+    Linux)
+      local name="Linux"
+      if [ -r /etc/os-release ]; then
+        name="$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-Linux}")"
+      fi
+      if grep -qi microsoft /proc/version 2>/dev/null; then
+        name="$name (WSL)"
+      fi
+      printf '%s' "$name"
+      ;;
+    MINGW* | MSYS* | CYGWIN*)
+      printf 'Windows (%s)' "$(uname -s)"
+      ;;
+    *)
+      uname -s
+      ;;
+  esac
+}
+
+cpu_count() {
+  getconf _NPROCESSORS_ONLN 2>/dev/null || echo unknown
+}
+
+memory_mb() {
+  case "$(uname -s)" in
+    Darwin)
+      sysctl -n hw.memsize 2>/dev/null | awk '{ printf "%d", $1 / 1048576 }' || echo unknown
+      ;;
+    *)
+      if [ -r /proc/meminfo ]; then
+        awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo
+      else
+        echo unknown
+      fi
+      ;;
+  esac
+}
+
+cmd_info() {
+  local os arch cpus memory shell_name self
+  os="$(os_name)"
+  arch="$(uname -m)"
+  cpus="$(cpu_count)"
+  memory="$(memory_mb)"
+  shell_name="${SHELL:-unknown}"
+  self="$(self_path)"
+
+  case "${1:-}" in
+    --json)
+      printf '{"version":"%s","os":"%s","arch":"%s","cpus":"%s","memory_mb":"%s","bash":"%s","shell":"%s","path":"%s"}\n' \
+        "$VERSION" "$(json_escape "$os")" "$(json_escape "$arch")" "$cpus" "$memory" \
+        "$(json_escape "$BASH_VERSION")" "$(json_escape "$shell_name")" "$(json_escape "$self")"
+      ;;
+    "")
+      printf '%sDevice%s\n' "$BOLD" "$RESET"
+      printf '  OS:      %s\n' "$os"
+      printf '  CPU:     %s (%s cores)\n' "$arch" "$cpus"
+      printf '  Memory:  %s MB\n' "$memory"
+      printf '  Bash:    %s\n' "$BASH_VERSION"
+      printf '  Shell:   %s\n' "$shell_name"
+      printf '  Runs at: %s\n' "$self"
+      ;;
+    *)
+      die "unknown option for info: $1"
+      ;;
+  esac
+}
+
+# ---------- doctor ----------
+
+PROBLEMS=0
+WARNINGS=0
+
+pass() { printf '  %sok%s    %s\n' "$GREEN" "$RESET" "$*"; }
+warn() {
+  WARNINGS=$((WARNINGS + 1))
+  printf '  %swarn%s  %s\n' "$YELLOW" "$RESET" "$*"
+}
+fail() {
+  PROBLEMS=$((PROBLEMS + 1))
+  printf '  %sfail%s  %s\n' "$RED" "$RESET" "$*"
+}
+
+cmd_doctor() {
+  local bin_dir free_kb
+  bin_dir="$(dirname "$(self_path)")"
+  printf '%sChecking this device%s\n' "$BOLD" "$RESET"
+
+  pass "bash $BASH_VERSION"
+
+  if command -v curl >/dev/null 2>&1; then
+    pass "curl is installed"
+  else
+    fail "curl is missing, so update won't work"
+  fi
+
+  case ":$PATH:" in
+    *":$bin_dir:"*) pass "$bin_dir is on your PATH" ;;
+    *) warn "$bin_dir is not on your PATH" ;;
+  esac
+
+  if [ -w "$bin_dir" ]; then
+    pass "$bin_dir is writable"
+  else
+    warn "$bin_dir is not writable, so update and uninstall won't work"
+  fi
+
+  if mkdir -p "$DATA_DIR" 2>/dev/null && [ -w "$DATA_DIR" ]; then
+    pass "notes can be saved in $DATA_DIR"
+  else
+    fail "can't write to $DATA_DIR"
+  fi
+
+  free_kb="$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }' || true)"
+  if [ -z "$free_kb" ]; then
+    warn "couldn't read free disk space"
+  elif [ "$free_kb" -lt 102400 ]; then
+    warn "less than 100 MB of disk space is free"
+  else
+    pass "$((free_kb / 1024)) MB of disk space is free"
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "skipped the network check because curl is missing"
+  elif curl -fsS -o /dev/null --max-time 8 "$UPDATE_URL" 2>/dev/null; then
+    pass "the update server can be reached"
+  else
+    fail "can't reach $UPDATE_URL"
+  fi
+
+  printf '\n%s problem(s), %s warning(s)\n' "$PROBLEMS" "$WARNINGS"
+  [ "$PROBLEMS" -eq 0 ]
+}
+
+# ---------- notes ----------
+
+notes_init() {
+  mkdir -p "$DATA_DIR" || die "can't create $DATA_DIR"
+  [ -f "$NOTES_FILE" ] || : >"$NOTES_FILE" || die "can't create $NOTES_FILE"
+}
+
+valid_note_id() {
+  case "${1:-}" in
+    "" | *[!0-9]*) die "note ID must be a number" ;;
+  esac
+  awk -F '\t' -v id="$1" '$1 == id { found = 1 } END { exit !found }' "$NOTES_FILE" || die "no note with ID $1"
+}
+
+rewrite_notes() {
+  local tmp="$NOTES_FILE.tmp"
+  awk -F '\t' -v OFS='\t' -v id="$1" -v action="$2" '
+    $1 == id && action == "rm" { next }
+    $1 == id && action == "done" { $2 = 1 }
+    { print }
+  ' "$NOTES_FILE" >"$tmp"
+  mv "$tmp" "$NOTES_FILE"
+}
+
+confirm() {
+  local answer=""
+  printf '%s [y/N] ' "$1"
+  read -r answer || answer=""
+  case "$answer" in
+    y | Y | yes | YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_note() {
+  local action="${1:-list}"
+  [ $# -eq 0 ] || shift
+  notes_init
+
+  case "$action" in
+    add)
+      [ $# -gt 0 ] || die "usage: trycli note add TEXT"
+      local text id
+      text="$(printf '%s' "$*" | tr '\t\n\r' '   ')"
+      [ -n "${text// /}" ] || die "a note can't be empty"
+      id="$(awk -F '\t' '$1 > max { max = $1 } END { print max + 1 }' "$NOTES_FILE")"
+      printf '%s\t0\t%s\t%s\n' "$id" "$(date +%Y-%m-%d)" "$text" >>"$NOTES_FILE"
+      printf 'Saved note %s\n' "$id"
+      ;;
+    list)
+      if [ ! -s "$NOTES_FILE" ]; then
+        echo 'No notes yet. Add one with: trycli note add TEXT'
+        return 0
+      fi
+      awk -F '\t' -v green="$GREEN" -v dim="$DIM" -v reset="$RESET" '{
+        if ($2 == 1) { printf "%3s  %s[x]%s  %s%s  %s%s\n", $1, green, reset, dim, $3, $4, reset; done++ }
+        else         { printf "%3s  [ ]  %s  %s\n", $1, $3, $4 }
+      } END { printf "\n%d note(s), %d done\n", NR, done }' "$NOTES_FILE"
+      ;;
+    done)
+      valid_note_id "${1:-}"
+      rewrite_notes "$1" done
+      printf 'Marked note %s as done\n' "$1"
+      ;;
+    rm)
+      valid_note_id "${1:-}"
+      rewrite_notes "$1" rm
+      printf 'Deleted note %s\n' "$1"
+      ;;
+    clear)
+      if [ "${1:-}" != "-y" ] && ! confirm "Delete all notes?"; then
+        echo "Nothing deleted."
+        return 0
+      fi
+      : >"$NOTES_FILE"
+      echo "Deleted all notes."
+      ;;
+    *)
+      die "unknown note command: $action (try: trycli help)"
+      ;;
+  esac
+}
+
+# ---------- update and uninstall ----------
+
+TMP_FILE=""
+cleanup() {
+  if [ -n "$TMP_FILE" ]; then rm -f "$TMP_FILE"; fi
+}
+trap cleanup EXIT
+
+cmd_update() {
+  local check_only=0 self latest
+  case "${1:-}" in
+    --check) check_only=1 ;;
+    "") ;;
+    *) die "unknown option for update: $1" ;;
+  esac
+  command -v curl >/dev/null 2>&1 || die "update needs curl"
+
+  self="$(self_path)"
+  TMP_FILE="$(mktemp "${TMPDIR:-/tmp}/trycli.XXXXXX")"
+  curl -fsSL --max-time 30 "$UPDATE_URL" -o "$TMP_FILE" || die "couldn't download the update"
+
+  # Refuse anything that isn't a working copy of this script, such as an error page.
+  [ "$(head -n 1 "$TMP_FILE")" = "#!/usr/bin/env bash" ] || die "the download isn't a trycli script"
+  bash -n "$TMP_FILE" 2>/dev/null || die "the download has syntax errors"
+  latest="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$TMP_FILE")"
+  [ -n "$latest" ] || die "the download has no version"
+
+  if [ "$latest" = "$VERSION" ]; then
+    printf 'Already on the latest version (%s).\n' "$VERSION"
+    return 0
+  fi
+  if [ "$check_only" -eq 1 ]; then
+    printf 'Installed: %s\nAvailable: %s\nRun: trycli update\n' "$VERSION" "$latest"
+    return 0
+  fi
+
+  [ -w "$(dirname "$self")" ] || die "can't write to $(dirname "$self")"
+  # Written next to the old file first, so the final move can't leave a half-written CLI.
+  cp "$TMP_FILE" "$self.new"
+  chmod +x "$self.new"
+  mv "$self.new" "$self"
+  printf 'Updated trycli from %s to %s.\n' "$VERSION" "$latest"
+}
+
+cmd_uninstall() {
+  local assume_yes=0 purge=0 self
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y) assume_yes=1 ;;
+      --purge) purge=1 ;;
+      *) die "unknown option for uninstall: $1" ;;
+    esac
+    shift
+  done
+
+  self="$(self_path)"
+  printf 'This removes %s\n' "$self"
+  if [ "$purge" -eq 1 ]; then printf 'and your notes in %s\n' "$DATA_DIR"; fi
+  if [ "$assume_yes" -eq 0 ] && ! confirm "Continue?"; then
+    echo "Nothing removed."
+    return 0
+  fi
+
+  rm -f "$self"
+  if [ "$purge" -eq 1 ]; then rm -rf "$DATA_DIR"; fi
+  echo "trycli has been removed."
+  if [ "$purge" -eq 0 ] && [ -d "$DATA_DIR" ]; then
+    printf 'Your notes are still in %s\n' "$DATA_DIR"
+  fi
+}
+
+# ---------- entry point ----------
+
+main() {
+  if [ "${1:-}" = "--no-color" ]; then
+    shift
+  elif [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    enable_color
+  fi
+
+  local command="${1:-}"
+  [ $# -eq 0 ] || shift
+
+  case "$command" in
+    "")
+      printf '%strycli is working on this device.%s\n\n' "$GREEN" "$RESET"
+      cmd_info
+      printf '\nRun %strycli help%s to see all commands.\n' "$BOLD" "$RESET"
+      ;;
+    info) cmd_info "$@" ;;
+    doctor) cmd_doctor ;;
+    hello) printf 'Hello, %s!\n' "${*:-world}" ;;
+    note) cmd_note "$@" ;;
+    update) cmd_update "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    version | -v | --version) printf 'trycli %s\n' "$VERSION" ;;
+    help | -h | --help) usage ;;
+    *) die "unknown command: $command (try: trycli help)" ;;
+  esac
+}
+
+main "$@"
