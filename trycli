@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# A minimal CLI for testing installation on different devices.
+set -eu
+
+VERSION="0.1.0"
+
+case "${1:-}" in
+  "")
+    echo "trycli is working on this device."
+    echo "  OS:      $(uname -s)"
+    echo "  CPU:     $(uname -m)"
+    echo "  Shell:   ${SHELL:-unknown}"
+    echo "  Runs at: $0"
+    ;;
+  hello)
+    echo "Hello, ${2:-world}!"
+    ;;
+  -v | --version)
+    echo "trycli $VERSION"
+    ;;
+  -h | --help)
+    echo "Usage: trycli [hello NAME | --version | --help]"
+    ;;
+  *)
+    echo "Unknown command: $1 (try: trycli --help)" >&2
+    exit 1
+    ;;
+esac
